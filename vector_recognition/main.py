@@ -1,98 +1,107 @@
+import matplotlib.pyplot as plt
 import numpy as np
-import cv2
-import os
-import shutil
 from skimage.measure import label, regionprops
+from skimage.io import imread
 from pathlib import Path
 
-CANVAS_SIZE = 256
-REF_VEC_SIZE = 20
-root_dir = Path(__file__).parent.absolute()
-out_dir = root_dir / "vector_recognition"
+save_path = Path(__file__).parent
 
-if out_dir.exists():
-    shutil.rmtree(out_dir)
-out_dir.mkdir(exist_ok=True)
+def count_holes(region):
+    shape = region.image.shape
+    new_image = np.zeros((shape[0] + 2, shape[1] + 2))
+    new_image[1:-1, 1:-1] = region.image
+    new_image = np.logical_not(new_image)
+    labeled = label(new_image)
+    return np.max(labeled)
 
-def preprocess(path):
-    """Продвинутая бинаризация: понимает прозрачность и любые фоны"""
-    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Не могу прочитать {path}")
-        
-    if len(img.shape) == 3 and img.shape[2] == 4:
-        alpha = img[:, :, 3]
-        if np.min(alpha) < 255: 
-            return (alpha > 50).astype(int)
-    
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img
-        
-    if np.mean(gray) > 127: 
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-    else:                 
-        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-        
-    return (thresh > 0).astype(int)
+def check_diagonal_density(region):
+    img = region.image
+    h, w = img.shape
+    half_h, half_w = h // 2, w // 2
+    top_right = img[:half_h, half_w:].sum()
+    bottom_left = img[half_h:, :half_w].sum()
+    return (top_right + bottom_left) / img.sum()
 
-def get_vec(region):
-    """Делает вектор 20x20"""
-    sym = (region.image * 255).astype('uint8')
-    res = cv2.resize(sym, (REF_VEC_SIZE, REF_VEC_SIZE), interpolation=cv2.INTER_AREA)
-    return res.flatten().astype(float)
+def check_symmetry(region):
+    img = region.image
+    flipped_lr = np.fliplr(img)
+    flipped_ud = np.flipud(img)
+    sym_lr = np.logical_and(img, flipped_lr).sum() / img.sum()
+    sym_ud = np.logical_and(img, flipped_ud).sum() / img.sum()
+    return sym_lr, sym_ud
 
-ref_labels = ["A", "B", "8", "0", "1", "W", "X", "star", "minus", "slash"]
+def extractor(region):
+    cy, cx = region.centroid_local
+    cy /= region.image.shape[0]
+    cx /= region.image.shape[1]
+    perimeter = region.perimeter / region.image.size
+    holes = count_holes(region)
+    density = check_diagonal_density(region)
+    sym_lr, sym_ud = check_symmetry(region)
+    vlines = (np.sum(region.image, 0) == region.image.shape[1]).sum()
+    hlines = (np.sum(region.image, 1) == region.image.shape[0]).sum()
+    eccentricity = region.eccentricity
+    aspect = region.image.shape[0] / region.image.shape[1]
+    return np.array([cy, cx, holes, eccentricity, aspect, density, sym_lr, sym_ud])
 
-raw_ref_bins = regionprops(label(preprocess(root_dir / "alphabet-small.png")))
-ref_bins = [r for r in raw_ref_bins if r.area > 10] 
-ref_bins.sort(key=lambda x: x.bbox[1]) # Слева направо
+def classificator(region, templates):
+    features = extractor(region)
+    result = ""
+    min_d = 10 ** 16
+    for symbol, t in templates.items():
+        d = ((t - features) ** 2).sum() ** 0.5
+        if d < min_d:
+            result = symbol
+            min_d = d
 
-references = []
-for i, reg in enumerate(ref_bins):
-    if i < len(ref_labels):
-        references.append({"label": ref_labels[i], "vector": get_vec(reg)})
+    return result
 
-print(f"Загружено эталонов: {len(references)} из {len(ref_labels)}")
-if not references:
-    print("ОШИБКА: Эталоны не найдены! Проверь картинку alphabet-small.png")
-    exit()
+template = imread("alphabet-small.png")[:, :, :-1]
+print(template.shape)
+template = template.sum(2)
+binary = template != 765.
 
-target_bins = regionprops(label(preprocess(root_dir / "alphabet.png")))
-print(f"Найдено объектов: {len(target_bins)}. Идет классификация...")
+labeled = label(binary)
+props = regionprops(labeled)
 
-count = 0
-for reg in target_bins:
-    if reg.area < 10: continue 
-    
-    t_vec = get_vec(reg)
-    match_name = "unknown"
-    min_dist = float('inf')
-    
-    for r in references:
-        dist = np.linalg.norm(t_vec - r['vector'])
-        if dist < min_dist:
-            min_dist = dist
-            match_name = r['label'] 
+templates = {}
 
-    sym_img = (reg.image * 255).astype('uint8')
-    h, w = sym_img.shape
-    scale = (CANVAS_SIZE * 0.6) / max(h, w)
-    sym_res = cv2.resize(sym_img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
-    
-    canvas = np.zeros((CANVAS_SIZE, CANVAS_SIZE), dtype='uint8')
-    y_off = (CANVAS_SIZE - sym_res.shape[0]) // 2
-    x_off = (CANVAS_SIZE - sym_res.shape[1]) // 2
-    canvas[y_off:y_off+sym_res.shape[0], x_off:x_off+sym_res.shape[1]] = sym_res
-    
-    cv2.putText(canvas, f"Class: {match_name}", (15, 40), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
-    
-    char_dir = out_dir / match_name
-    char_dir.mkdir(exist_ok=True)
-    
-    count += 1
-    cv2.imwrite(str(char_dir / f"symbol_{count}.png"), canvas)
+for region, symbol in zip(props, ["8", "0", "A", "B", "1", "W", "X", "*", "/", "-"]):
+    templates[symbol] = extractor(region)
 
-print(f"Успех! Сохранено нормальных картинок: {count}. Проверяй папку '{out_dir.name}'")
+# print(templates)
+
+print(type(props[0]))
+print(props[0].area, props[0].centroid, props[0].label)
+print(classificator(props[0], templates))
+
+image = imread("alphabet.png")[:,:,:-1]
+abinary = image.mean(2) > 0
+alabeled = label(abinary)
+print("Всего:", np.max(alabeled))
+aprops = regionprops(alabeled)
+result = {}
+
+image_path = save_path / "out"
+image_path.mkdir(exist_ok=True)
+
+# print(count_holes(aprops[0]))
+
+# plt.ion()
+plt.figure(figsize=(5, 7))
+
+for region in aprops:
+    symbol = classificator(region, templates)
+    if symbol not in result:
+        result[symbol] = 0
+    result[symbol] += 1
+    plt.cla()
+    plt.title(f"Class - '{symbol}'")
+    plt.imshow(region.image)
+    plt.savefig(image_path / f"image_{region.label}.png")
+
+print(result)
+print(f"Процент распознавания: {(1 - result.get('?', 0) / len(aprops)) * 100}")
+
+plt.imshow(abinary)
+plt.show()
